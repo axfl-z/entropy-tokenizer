@@ -1,4 +1,5 @@
 use entropy_tokenizer::encoder::Encoder;
+use entropy_tokenizer::stats;
 use entropy_tokenizer::trainer::Trainer;
 use entropy_tokenizer::vocab::Vocabulary;
 
@@ -320,4 +321,139 @@ fn test_decode_to_string() {
     let tokens = encoder.encode(b"hello");
     let s = encoder.decode_to_string(&tokens);
     assert_eq!(s, "hello");
+}
+
+// ─── Dense Encoding Tests ───
+
+#[test]
+fn test_dense_encoding_roundtrip() {
+    let corpus = b"the quick brown fox jumps over the lazy dog ";
+    let mut big_corpus = Vec::new();
+    for _ in 0..100 {
+        big_corpus.extend_from_slice(corpus);
+    }
+    let encoder = train_encoder(&big_corpus, 512);
+    let tokens = encoder.encode_dense(&big_corpus);
+    assert_eq!(encoder.decode(&tokens), big_corpus);
+}
+
+#[test]
+fn test_dense_fewer_or_equal_tokens_than_greedy() {
+    let corpus = b"abcdefg abcdefg abcdefg hello world hello world test test test";
+    let mut big_corpus = Vec::new();
+    for _ in 0..100 {
+        big_corpus.extend_from_slice(corpus);
+    }
+    let encoder = train_encoder(&big_corpus, 300);
+
+    let dense = encoder.encode_dense(&big_corpus);
+    let greedy = encoder.encode_greedy(&big_corpus);
+    assert!(
+        dense.len() <= greedy.len(),
+        "dense ({}) should be <= greedy ({})",
+        dense.len(),
+        greedy.len()
+    );
+    assert_eq!(encoder.decode(&dense), big_corpus);
+}
+
+// ─── Entropy Tests (H1, H2, H3) ───
+
+#[test]
+fn test_h1_unigram_entropy_positive() {
+    let corpus = b"the quick brown fox jumps over the lazy dog ";
+    let mut big_corpus = Vec::new();
+    for _ in 0..100 {
+        big_corpus.extend_from_slice(corpus);
+    }
+    let encoder = train_encoder(&big_corpus, 512);
+    let tokens = encoder.encode(&big_corpus);
+
+    let uni_counts = stats::collect_unigram_counts(&tokens);
+    let h1 = stats::entropy_from_map(&uni_counts);
+    assert!(h1 > 0.0, "H1 unigram entropy should be positive, got {}", h1);
+    assert!(h1 < 20.0, "H1 should be bounded, got {}", h1);
+}
+
+#[test]
+fn test_h2_bigram_entropy_positive() {
+    let corpus = b"the quick brown fox jumps over the lazy dog ";
+    let mut big_corpus = Vec::new();
+    for _ in 0..100 {
+        big_corpus.extend_from_slice(corpus);
+    }
+    let encoder = train_encoder(&big_corpus, 512);
+    let tokens = encoder.encode(&big_corpus);
+
+    let bi_counts = stats::collect_bigram_counts(&tokens);
+    let h2 = stats::bigram_entropy(&bi_counts);
+    assert!(h2 > 0.0, "H2 bigram entropy should be positive, got {}", h2);
+}
+
+#[test]
+fn test_h3_trigram_entropy_positive() {
+    let corpus = b"the quick brown fox jumps over the lazy dog ";
+    let mut big_corpus = Vec::new();
+    for _ in 0..100 {
+        big_corpus.extend_from_slice(corpus);
+    }
+    let encoder = train_encoder(&big_corpus, 512);
+    let tokens = encoder.encode(&big_corpus);
+
+    let tri_counts = stats::collect_trigram_counts(&tokens);
+    let h3 = stats::trigram_entropy(&tri_counts);
+    assert!(h3 > 0.0, "H3 trigram entropy should be positive, got {}", h3);
+}
+
+#[test]
+fn test_entropy_hierarchy_h1_ge_h2_ge_h3() {
+    let corpus = b"the quick brown fox jumps over the lazy dog ";
+    let mut big_corpus = Vec::new();
+    for _ in 0..200 {
+        big_corpus.extend_from_slice(corpus);
+    }
+    let encoder = train_encoder(&big_corpus, 512);
+    let tokens = encoder.encode(&big_corpus);
+
+    let uni_counts = stats::collect_unigram_counts(&tokens);
+    let bi_counts = stats::collect_bigram_counts(&tokens);
+    let tri_counts = stats::collect_trigram_counts(&tokens);
+
+    let h1 = stats::entropy_from_map(&uni_counts);
+    let h2 = stats::bigram_entropy(&bi_counts);
+    let h3 = stats::trigram_entropy(&tri_counts);
+
+    assert!(
+        h1 >= h2,
+        "H1 ({:.4}) should be >= H2 ({:.4}): conditioning reduces entropy",
+        h1, h2
+    );
+    assert!(
+        h2 >= h3,
+        "H2 ({:.4}) should be >= H3 ({:.4}): more context reduces entropy",
+        h2, h3
+    );
+}
+
+#[test]
+fn test_entropy_decreases_with_larger_vocab() {
+    let corpus = b"the quick brown fox jumps over the lazy dog ";
+    let mut big_corpus = Vec::new();
+    for _ in 0..200 {
+        big_corpus.extend_from_slice(corpus);
+    }
+
+    let encoder_small = train_encoder(&big_corpus, 280);
+    let encoder_large = train_encoder(&big_corpus, 512);
+
+    let tokens_small = encoder_small.encode(&big_corpus);
+    let tokens_large = encoder_large.encode(&big_corpus);
+
+    // Larger vocab should produce fewer tokens (better compression)
+    assert!(
+        tokens_large.len() <= tokens_small.len(),
+        "larger vocab ({}) should produce <= tokens than smaller vocab ({})",
+        tokens_large.len(),
+        tokens_small.len()
+    );
 }

@@ -112,6 +112,32 @@ pub mod pymod {
             Ok(tokens)
         }
 
+        /// Encode text using density-optimal DP (minimizes token count).
+        /// Releases the GIL during encoding.
+        ///
+        /// Args:
+        ///     text: Input text (str or bytes).
+        ///
+        /// Returns:
+        ///     List of token IDs (fewest possible tokens).
+        fn encode_dense(&self, text: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
+            let bytes: Vec<u8> = if let Ok(s) = text.extract::<String>() {
+                s.into_bytes()
+            } else if let Ok(b) = text.extract::<Vec<u8>>() {
+                b
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "text must be str or bytes",
+                ));
+            };
+
+            let tokens = Python::with_gil(|py| {
+                py.allow_threads(|| self.encoder.encode_dense(&bytes))
+            });
+
+            Ok(tokens)
+        }
+
         /// Encode text and return token IDs along with byte offsets.
         /// Releases the GIL during encoding.
         ///

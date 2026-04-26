@@ -176,6 +176,75 @@ impl Encoder {
         result
     }
 
+    /// DP encoding that minimizes token count (maximizes density).
+    /// Unlike encode_dp which maximizes log-probability, this purely
+    /// minimizes the number of tokens produced — the densest possible encoding.
+    pub fn encode_dense(&self, input: &[u8]) -> Vec<u32> {
+        let n = input.len();
+        if n == 0 {
+            return vec![];
+        }
+
+        // dp_count[i] = minimum tokens to encode input[0..i]
+        let mut dp_count = vec![u32::MAX; n + 1];
+        let mut dp_token = vec![0u32; n + 1];
+        let mut dp_prev_pos = vec![0usize; n + 1];
+        dp_count[0] = 0;
+
+        let max_len = self.max_token_len.min(n);
+
+        for i in 0..n {
+            if dp_count[i] == u32::MAX {
+                continue;
+            }
+
+            let cur_count = dp_count[i];
+            let end_limit = (i + max_len).min(n);
+            let mut node: u32 = 0;
+
+            #[allow(clippy::needless_range_loop)]
+            for j in i..end_limit {
+                let (next_node, tid_plus_1) = self.trie.step(node, input[j]);
+                if next_node == 0 {
+                    break;
+                }
+                node = next_node;
+
+                if tid_plus_1 != 0 {
+                    let token_id = tid_plus_1 - 1;
+                    let end = j + 1;
+                    let new_count = cur_count + 1;
+
+                    if new_count < dp_count[end] {
+                        dp_count[end] = new_count;
+                        dp_token[end] = token_id;
+                        dp_prev_pos[end] = i;
+                    }
+                }
+            }
+
+            // Fallback: single byte
+            if node == 0 {
+                let byte_id = input[i] as u32;
+                let new_count = cur_count + 1;
+                if new_count < dp_count[i + 1] {
+                    dp_count[i + 1] = new_count;
+                    dp_token[i + 1] = byte_id;
+                    dp_prev_pos[i + 1] = i;
+                }
+            }
+        }
+
+        let mut tokens = Vec::new();
+        let mut pos = n;
+        while pos > 0 {
+            tokens.push(dp_token[pos]);
+            pos = dp_prev_pos[pos];
+        }
+        tokens.reverse();
+        tokens
+    }
+
     /// Greedy encoding (left-to-right longest match) — fastest mode
     pub fn encode_greedy(&self, input: &[u8]) -> Vec<u32> {
         let n = input.len();

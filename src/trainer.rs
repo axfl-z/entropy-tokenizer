@@ -96,20 +96,16 @@ impl Trainer {
 
         match self.phase {
             0 => {
-                // Phase 0: Compression-focused (like BPE but with entropy tiebreaker)
-                // Primary: frequency. Secondary: entropy delta as small bonus.
-                let entropy_delta = stats::entropy_delta_for_merge(
-                    &self.token_counts,
-                    left_id,
-                    right_id,
-                    next_id,
-                    pair_count,
-                );
-                // Use entropy as a small tiebreaker (0.05 weight)
-                freq + 0.05 * entropy_delta.max(0.0) * freq.sqrt()
+                // Phase 0: Pure compression (maximize bytes saved per merge).
+                // Score = freq * merged_len (bytes saved = freq * (left_len + right_len - 1))
+                // This directly optimizes for density like BPE but weighted by
+                // how many bytes each merge actually saves.
+                let left_len = self.vocab.get_bytes(left_id).len() as f64;
+                let right_len = self.vocab.get_bytes(right_id).len() as f64;
+                freq * (left_len + right_len)
             }
             _ => {
-                // Phase 1: Entropy-optimized
+                // Phase 1: Entropy-optimized refinement
                 let entropy_delta = stats::entropy_delta_for_merge(
                     &self.token_counts,
                     left_id,
@@ -117,7 +113,10 @@ impl Trainer {
                     next_id,
                     pair_count,
                 );
-                freq.powf(0.8) * (1.0 + 0.5 * entropy_delta)
+                let left_len = self.vocab.get_bytes(left_id).len() as f64;
+                let right_len = self.vocab.get_bytes(right_id).len() as f64;
+                let byte_score = freq * (left_len + right_len);
+                byte_score.powf(0.7) * (1.0 + 0.3 * entropy_delta)
             }
         }
     }
@@ -127,7 +126,7 @@ impl Trainer {
         let mut best: Option<((u32, u32), u64, f64)> = None;
 
         for (&(left, right), &count) in &self.pair_counts {
-            if count < 2 {
+            if count < 1 {
                 continue;
             }
             let count_u64 = count as u64;
@@ -229,8 +228,8 @@ impl Trainer {
         }
 
         for step in 0..num_merges {
-            // Phase transition: first 80% compression-focused, last 20% entropy-guided
-            let phase_boundary = (num_merges * 4) / 5;
+            // Phase transition: first 90% compression-focused, last 10% entropy-guided
+            let phase_boundary = (num_merges * 9) / 10;
             if step < phase_boundary {
                 self.phase = 0;
             } else {
