@@ -175,7 +175,7 @@ pub mod pymod {
 
             // Rebuild encoder with pruned vocab
             let context_weight = self.encoder.context_weight();
-            let vocab = self.encoder.take_vocab();
+            let vocab = self.encoder.vocab().clone();
             self.encoder = Encoder::new(vocab, context_weight);
 
             eprintln!("Pruned vocab: {} -> {} tokens", old_size, new_size);
