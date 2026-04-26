@@ -36,43 +36,54 @@ pub fn normalized_entropy(counts: &[u64], vocab_size: usize) -> f64 {
     h / max_h
 }
 
-/// Compute the entropy delta if we merge two tokens (pair) into one new token.
+/// Fast analytical approximation of entropy delta for a merge.
+/// Avoids cloning the entire token_counts HashMap.
 /// Returns the change in entropy (positive = entropy increased = more uniform).
 pub fn entropy_delta_for_merge(
     token_counts: &HashMap<u32, u64>,
     left_id: u32,
     right_id: u32,
-    new_id: u32,
+    _new_id: u32,
     pair_count: u64,
 ) -> f64 {
-    let old_entropy = entropy_from_map(token_counts);
-
-    let mut new_counts = token_counts.clone();
-
-    let left_count = new_counts.get(&left_id).copied().unwrap_or(0);
-    let right_count = new_counts.get(&right_id).copied().unwrap_or(0);
-
-    if left_count >= pair_count {
-        let new_left = left_count - pair_count;
-        if new_left == 0 {
-            new_counts.remove(&left_id);
-        } else {
-            new_counts.insert(left_id, new_left);
-        }
+    let total: u64 = token_counts.values().sum();
+    if total == 0 {
+        return 0.0;
     }
-    if right_count >= pair_count {
-        let new_right = right_count - pair_count;
-        if new_right == 0 {
-            new_counts.remove(&right_id);
-        } else {
-            new_counts.insert(right_id, new_right);
-        }
+    let n = total as f64;
+    let pc = pair_count as f64;
+    let left_count = token_counts.get(&left_id).copied().unwrap_or(0) as f64;
+    let right_count = token_counts.get(&right_id).copied().unwrap_or(0) as f64;
+
+    // The merge reduces total token count by pair_count (two tokens become one)
+    let new_n = n - pc;
+    if new_n <= 0.0 {
+        return 0.0;
     }
 
-    new_counts.insert(new_id, pair_count);
+    // Compute entropy contribution changes analytically
+    // Old contributions from left, right tokens
+    let h_contrib = |count: f64, tot: f64| -> f64 {
+        if count <= 0.0 || tot <= 0.0 {
+            0.0
+        } else {
+            let p = count / tot;
+            -p * p.log2()
+        }
+    };
 
-    let new_entropy = entropy_from_map(&new_counts);
-    new_entropy - old_entropy
+    let old_left = h_contrib(left_count, n);
+    let old_right = h_contrib(right_count, n);
+
+    let new_left_count = left_count - pc;
+    let new_right_count = right_count - pc;
+
+    let new_left = h_contrib(new_left_count, new_n);
+    let new_right = h_contrib(new_right_count, new_n);
+    let new_merged = h_contrib(pc, new_n);
+
+    // Approximate: only the changed tokens matter
+    (new_left + new_right + new_merged) - (old_left + old_right)
 }
 
 /// Compute bigram entropy: H(T_{i+1} | T_i) — context entropy

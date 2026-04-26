@@ -1,0 +1,33 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "entropy-tokenizer"
+version = "0.1.0"
+description = "Entropy-optimal tokenizer — faster and denser than BPE, lossless, GIL-free Rust backend"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Text Processing",
+]
+keywords = ["tokenizer", "bpe", "entropy", "nlp", "rust"]
+
+[project.urls]
+Repository = "https://github.com/entropy-tokenizer/entropy-tokenizer"
+
+[tool.maturin]
+features = ["python"]
+module-name = "entropy_tokenizer.entropy_tokenizer_core"
