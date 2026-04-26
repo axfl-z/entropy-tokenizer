@@ -1,0 +1,27 @@
+# Build artifacts
+/target
+/.venv
+
+# Test/benchmark artifacts
+test_corpus.txt
+test_model.json
+train_corpus.txt
+bench_input.txt
+benchmark_corpus.txt
+benchmark_chart.png
+benchmark_report.md
+benchmark_results.json
+eot_bench_model.json
+eot_test_*.json
+bpe_model.json
+wordpiece_model.json
+unigram_model.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.whl
+*.so
