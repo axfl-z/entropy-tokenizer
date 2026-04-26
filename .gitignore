@@ -11,7 +11,13 @@ benchmark_corpus.txt
 benchmark_chart.png
 benchmark_report.md
 benchmark_results.json
+benchmark_full_results.json
+benchmark_full_chart.png
+training_comparison_chart.png
 eot_bench_model.json
+eot_bench.json
+eot_bench_model2.json
+eot_v2048.json
 eot_test_*.json
 bpe_model.json
 wordpiece_model.json

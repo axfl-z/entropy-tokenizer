@@ -224,33 +224,56 @@ fn cmd_bench(model_path: &str, input_path: &str, context_weight: f64) {
         input_len as f64 / 1_048_576.0
     );
 
+    let token_entropy = |tokens: &[u32]| -> f64 {
+        let mut freq: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        for &t in tokens {
+            *freq.entry(t).or_insert(0) += 1;
+        }
+        stats::entropy_from_map(&freq)
+    };
+
+    // Dense (minimum token count) encoding
+    let start = Instant::now();
+    let dense_tokens = encoder.encode_dense(&input);
+    let dense_elapsed = start.elapsed();
+    let dense_decoded = encoder.decode(&dense_tokens);
+    let dense_roundtrip = dense_decoded == input;
+    let dense_entropy = token_entropy(&dense_tokens);
+
+    // DP-Optimal (entropy-aware) encoding
     let start = Instant::now();
     let dp_tokens = encoder.encode(&input);
     let dp_elapsed = start.elapsed();
+    let dp_decoded = encoder.decode(&dp_tokens);
+    let dp_roundtrip = dp_decoded == input;
+    let dp_entropy = token_entropy(&dp_tokens);
 
+    // Greedy encoding
     let start = Instant::now();
     let greedy_tokens = encoder.encode_greedy(&input);
     let greedy_elapsed = start.elapsed();
-
-    let dp_decoded = encoder.decode(&dp_tokens);
     let greedy_decoded = encoder.decode(&greedy_tokens);
-    let dp_roundtrip = dp_decoded == input;
     let greedy_roundtrip = greedy_decoded == input;
-
-    let mut dp_freq: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
-    for &t in &dp_tokens {
-        *dp_freq.entry(t).or_insert(0) += 1;
-    }
-    let dp_entropy = stats::entropy_from_map(&dp_freq);
-
-    let mut greedy_freq: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
-    for &t in &greedy_tokens {
-        *greedy_freq.entry(t).or_insert(0) += 1;
-    }
-    let greedy_entropy = stats::entropy_from_map(&greedy_freq);
+    let greedy_entropy = token_entropy(&greedy_tokens);
 
     println!("=== Benchmark Results ===");
     println!("Input: {} ({} bytes)", input_path, input_len);
+
+    println!();
+    println!("--- Dense Encoding (min tokens) ---");
+    println!("  Tokens:            {}", dense_tokens.len());
+    println!(
+        "  Compression ratio: {:.2} bytes/token",
+        stats::compression_ratio(input_len, dense_tokens.len())
+    );
+    println!("  Entropy:           {:.4} bits", dense_entropy);
+    println!(
+        "  Speed:             {:.2} ms ({:.2} MB/s)",
+        dense_elapsed.as_secs_f64() * 1000.0,
+        input_len as f64 / 1_048_576.0 / dense_elapsed.as_secs_f64()
+    );
+    println!("  Roundtrip OK:      {}", dense_roundtrip);
+
     println!();
     println!("--- DP-Optimal Encoding ---");
     println!("  Tokens:            {}", dp_tokens.len());
@@ -265,6 +288,7 @@ fn cmd_bench(model_path: &str, input_path: &str, context_weight: f64) {
         input_len as f64 / 1_048_576.0 / dp_elapsed.as_secs_f64()
     );
     println!("  Roundtrip OK:      {}", dp_roundtrip);
+
     println!();
     println!("--- Greedy Encoding ---");
     println!("  Tokens:            {}", greedy_tokens.len());
@@ -279,8 +303,18 @@ fn cmd_bench(model_path: &str, input_path: &str, context_weight: f64) {
         input_len as f64 / 1_048_576.0 / greedy_elapsed.as_secs_f64()
     );
     println!("  Roundtrip OK:      {}", greedy_roundtrip);
+
     println!();
     println!("--- Comparison ---");
+    println!(
+        "  Dense saves {} tokens ({:.2}% fewer) vs greedy",
+        greedy_tokens.len() as i64 - dense_tokens.len() as i64,
+        if greedy_tokens.is_empty() {
+            0.0
+        } else {
+            (1.0 - dense_tokens.len() as f64 / greedy_tokens.len() as f64) * 100.0
+        }
+    );
     println!(
         "  DP saves {} tokens ({:.2}% fewer) vs greedy",
         greedy_tokens.len() as i64 - dp_tokens.len() as i64,
@@ -289,9 +323,5 @@ fn cmd_bench(model_path: &str, input_path: &str, context_weight: f64) {
         } else {
             (1.0 - dp_tokens.len() as f64 / greedy_tokens.len() as f64) * 100.0
         }
-    );
-    println!(
-        "  DP entropy improvement: {:.4} bits",
-        dp_entropy - greedy_entropy
     );
 }

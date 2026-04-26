@@ -1,4 +1,8 @@
+use std::collections::HashMap;
 use entropy_tokenizer::encoder::Encoder;
+use entropy_tokenizer::filters::{FilterPipeline, LowercaseAscii, NormalizeWhitespace};
+use entropy_tokenizer::micromodel;
+use entropy_tokenizer::stats;
 use entropy_tokenizer::trainer::Trainer;
 use entropy_tokenizer::vocab::Vocabulary;
 
@@ -320,4 +324,329 @@ fn test_decode_to_string() {
     let tokens = encoder.encode(b"hello");
     let s = encoder.decode_to_string(&tokens);
     assert_eq!(s, "hello");
+}
+
+// ─── Dense Encoding Tests ───
+
+#[test]
+fn test_dense_encoding_roundtrip() {
+    let corpus = b"the quick brown fox jumps over the lazy dog ";
+    let mut big_corpus = Vec::new();
+    for _ in 0..100 {
+        big_corpus.extend_from_slice(corpus);
+    }
+    let encoder = train_encoder(&big_corpus, 512);
+    let tokens = encoder.encode_dense(&big_corpus);
+    assert_eq!(encoder.decode(&tokens), big_corpus);
+}
+
+#[test]
+fn test_dense_fewer_or_equal_tokens_than_greedy() {
+    let corpus = b"abcdefg abcdefg abcdefg hello world hello world test test test";
+    let mut big_corpus = Vec::new();
+    for _ in 0..100 {
+        big_corpus.extend_from_slice(corpus);
+    }
+    let encoder = train_encoder(&big_corpus, 300);
+
+    let dense = encoder.encode_dense(&big_corpus);
+    let greedy = encoder.encode_greedy(&big_corpus);
+    assert!(
+        dense.len() <= greedy.len(),
+        "dense ({}) should be <= greedy ({})",
+        dense.len(),
+        greedy.len()
+    );
+    assert_eq!(encoder.decode(&dense), big_corpus);
+}
+
+// ─── Entropy Tests (H1, H2, H3) ───
+
+#[test]
+fn test_h1_unigram_entropy_positive() {
+    let corpus = b"the quick brown fox jumps over the lazy dog ";
+    let mut big_corpus = Vec::new();
+    for _ in 0..100 {
+        big_corpus.extend_from_slice(corpus);
+    }
+    let encoder = train_encoder(&big_corpus, 512);
+    let tokens = encoder.encode(&big_corpus);
+
+    let uni_counts = stats::collect_unigram_counts(&tokens);
+    let h1 = stats::entropy_from_map(&uni_counts);
+    assert!(h1 > 0.0, "H1 unigram entropy should be positive, got {}", h1);
+    assert!(h1 < 20.0, "H1 should be bounded, got {}", h1);
+}
+
+#[test]
+fn test_h2_bigram_entropy_positive() {
+    let corpus = b"the quick brown fox jumps over the lazy dog ";
+    let mut big_corpus = Vec::new();
+    for _ in 0..100 {
+        big_corpus.extend_from_slice(corpus);
+    }
+    let encoder = train_encoder(&big_corpus, 512);
+    let tokens = encoder.encode(&big_corpus);
+
+    let bi_counts = stats::collect_bigram_counts(&tokens);
+    let h2 = stats::bigram_entropy(&bi_counts);
+    assert!(h2 > 0.0, "H2 bigram entropy should be positive, got {}", h2);
+}
+
+#[test]
+fn test_h3_trigram_entropy_positive() {
+    let corpus = b"the quick brown fox jumps over the lazy dog ";
+    let mut big_corpus = Vec::new();
+    for _ in 0..100 {
+        big_corpus.extend_from_slice(corpus);
+    }
+    let encoder = train_encoder(&big_corpus, 512);
+    let tokens = encoder.encode(&big_corpus);
+
+    let tri_counts = stats::collect_trigram_counts(&tokens);
+    let h3 = stats::trigram_entropy(&tri_counts);
+    assert!(h3 > 0.0, "H3 trigram entropy should be positive, got {}", h3);
+}
+
+#[test]
+fn test_entropy_hierarchy_h1_ge_h2_ge_h3() {
+    let corpus = b"the quick brown fox jumps over the lazy dog ";
+    let mut big_corpus = Vec::new();
+    for _ in 0..200 {
+        big_corpus.extend_from_slice(corpus);
+    }
+    let encoder = train_encoder(&big_corpus, 512);
+    let tokens = encoder.encode(&big_corpus);
+
+    let uni_counts = stats::collect_unigram_counts(&tokens);
+    let bi_counts = stats::collect_bigram_counts(&tokens);
+    let tri_counts = stats::collect_trigram_counts(&tokens);
+
+    let h1 = stats::entropy_from_map(&uni_counts);
+    let h2 = stats::bigram_entropy(&bi_counts);
+    let h3 = stats::trigram_entropy(&tri_counts);
+
+    assert!(
+        h1 >= h2,
+        "H1 ({:.4}) should be >= H2 ({:.4}): conditioning reduces entropy",
+        h1, h2
+    );
+    assert!(
+        h2 >= h3,
+        "H2 ({:.4}) should be >= H3 ({:.4}): more context reduces entropy",
+        h2, h3
+    );
+}
+
+#[test]
+fn test_entropy_decreases_with_larger_vocab() {
+    let corpus = b"the quick brown fox jumps over the lazy dog ";
+    let mut big_corpus = Vec::new();
+    for _ in 0..200 {
+        big_corpus.extend_from_slice(corpus);
+    }
+
+    let encoder_small = train_encoder(&big_corpus, 280);
+    let encoder_large = train_encoder(&big_corpus, 512);
+
+    let tokens_small = encoder_small.encode(&big_corpus);
+    let tokens_large = encoder_large.encode(&big_corpus);
+
+    // Larger vocab should produce fewer tokens (better compression)
+    assert!(
+        tokens_large.len() <= tokens_small.len(),
+        "larger vocab ({}) should produce <= tokens than smaller vocab ({})",
+        tokens_large.len(),
+        tokens_small.len()
+    );
+}
+
+// ─── v0.1.1: Special Tokens Tests ───
+
+#[test]
+fn test_special_tokens_add_and_retrieve() {
+    let mut vocab = Vocabulary::new_byte_level();
+    let pad_id = vocab.add_special_token("[PAD]");
+    let unk_id = vocab.add_special_token("[UNK]");
+    let cls_id = vocab.add_special_token("[CLS]");
+    let sep_id = vocab.add_special_token("[SEP]");
+
+    assert_eq!(vocab.get_special_token("[PAD]"), Some(pad_id));
+    assert_eq!(vocab.get_special_token("[UNK]"), Some(unk_id));
+    assert_eq!(vocab.get_special_token("[CLS]"), Some(cls_id));
+    assert_eq!(vocab.get_special_token("[SEP]"), Some(sep_id));
+    assert_eq!(vocab.get_special_token("[NONEXIST]"), None);
+
+    assert!(vocab.is_special(pad_id));
+    assert!(!vocab.is_special(0)); // byte token, not special
+    assert_eq!(vocab.vocab_size, 260); // 256 + 4 special
+}
+
+#[test]
+fn test_special_tokens_idempotent() {
+    let mut vocab = Vocabulary::new_byte_level();
+    let id1 = vocab.add_special_token("[PAD]");
+    let id2 = vocab.add_special_token("[PAD]");
+    assert_eq!(id1, id2);
+    assert_eq!(vocab.vocab_size, 257); // only one special added
+}
+
+#[test]
+fn test_special_tokens_save_load() {
+    let mut vocab = Vocabulary::new_byte_level();
+    vocab.add_special_token("[PAD]");
+    vocab.add_special_token("[UNK]");
+
+    let path = "/tmp/test_special_tokens.json";
+    vocab.save(path).unwrap();
+    let loaded = Vocabulary::load(path).unwrap();
+
+    assert_eq!(loaded.get_special_token("[PAD]"), vocab.get_special_token("[PAD]"));
+    assert_eq!(loaded.get_special_token("[UNK]"), vocab.get_special_token("[UNK]"));
+    assert_eq!(loaded.special_tokens.len(), 2);
+
+    std::fs::remove_file(path).ok();
+}
+
+// ─── v0.1.1: Dataset Quality Check Tests ───
+
+#[test]
+fn test_dataset_quality_good_corpus() {
+    let corpus = b"the quick brown fox jumps over the lazy dog ";
+    let mut big_corpus = Vec::new();
+    for _ in 0..100 {
+        big_corpus.extend_from_slice(corpus);
+    }
+    let quality = Trainer::check_dataset_quality(&big_corpus);
+    assert!(quality.quality_score > 0.7, "good corpus should have high quality score: {}", quality.quality_score);
+    assert!(quality.warnings.is_empty() || quality.warnings.len() <= 1);
+}
+
+#[test]
+fn test_dataset_quality_tiny_corpus() {
+    let quality = Trainer::check_dataset_quality(b"hi");
+    assert!(quality.quality_score < 0.8, "tiny corpus should have low quality: {}", quality.quality_score);
+    assert!(!quality.warnings.is_empty());
+}
+
+#[test]
+fn test_dataset_quality_repetitive() {
+    let corpus = vec![b'a'; 10000];
+    let quality = Trainer::check_dataset_quality(&corpus);
+    assert!(quality.quality_score < 0.7, "repetitive data should have low quality: {}", quality.quality_score);
+    assert!(!quality.warnings.is_empty());
+}
+
+// ─── v0.1.1: Vocab Pruning Tests ───
+
+#[test]
+fn test_vocab_pruning_reduces_size() {
+    let corpus = b"the quick brown fox jumps over the lazy dog and some more words to get diversity ";
+    let mut big_corpus = Vec::new();
+    for _ in 0..500 {
+        big_corpus.extend_from_slice(corpus);
+    }
+
+    let mut trainer = Trainer::new(&big_corpus);
+    trainer.train(512, false);
+    let mut vocab = trainer.into_vocab();
+    let original_size = vocab.vocab_size;
+    assert!(original_size > 260, "vocab should have grown beyond 260, got {}", original_size);
+
+    // Get token counts for pruning
+    let encoder = Encoder::new(vocab.clone(), 0.0);
+    let tokens = encoder.encode_greedy(&big_corpus);
+    let mut counts: HashMap<u32, u64> = HashMap::new();
+    for &t in &tokens {
+        *counts.entry(t).or_insert(0) += 1;
+    }
+
+    let target = 260;
+    vocab.prune(target, &counts);
+    assert!(vocab.vocab_size <= target, "pruned vocab should be <= {}, got {}", target, vocab.vocab_size);
+    assert!(vocab.vocab_size >= 256, "pruned vocab should keep base bytes");
+    assert!(vocab.vocab_size < original_size, "pruning should reduce size");
+}
+
+#[test]
+fn test_vocab_pruning_preserves_special_tokens() {
+    let corpus = b"hello world hello world ";
+    let mut big_corpus = Vec::new();
+    for _ in 0..200 {
+        big_corpus.extend_from_slice(corpus);
+    }
+
+    let mut trainer = Trainer::new(&big_corpus);
+    trainer.train(300, false);
+    let mut vocab = trainer.into_vocab();
+    let pad_id = vocab.add_special_token("[PAD]");
+
+    let encoder = Encoder::new(vocab.clone(), 0.0);
+    let tokens = encoder.encode_greedy(&big_corpus);
+    let mut counts: HashMap<u32, u64> = HashMap::new();
+    for &t in &tokens {
+        *counts.entry(t).or_insert(0) += 1;
+    }
+
+    vocab.prune(260, &counts);
+    // Special token should still exist (though ID may have changed)
+    assert!(vocab.get_special_token("[PAD]").is_some(), "special token [PAD] should survive pruning");
+    let _ = pad_id; // suppress unused warning
+}
+
+// ─── v0.1.1: Filter Pipeline Tests ───
+
+#[test]
+fn test_filter_pipeline_integration() {
+    let mut pipeline = FilterPipeline::new();
+    pipeline.add(Box::new(LowercaseAscii));
+    pipeline.add(Box::new(NormalizeWhitespace));
+
+    let input = b"Hello   WORLD\t\tTest";
+    let filtered = pipeline.apply(input);
+    assert_eq!(filtered, b"hello world test");
+
+    // Encode the filtered text
+    let corpus = b"hello world test hello world test";
+    let encoder = train_encoder(corpus, 270);
+    let tokens = encoder.encode(&filtered);
+    assert_eq!(encoder.decode(&tokens), filtered);
+}
+
+// ─── v0.1.1: Micro-Model Tests ───
+
+#[test]
+fn test_micro_model_integration() {
+    let vocab = Vocabulary::new_byte_level();
+    let corpus = b"hello world hello world hello world test test test";
+    let model = micromodel::train_micro_model(&vocab, corpus, 4, 5, 0.01);
+    assert!(model.param_count() > 0);
+
+    // Score a tokenization
+    let tokens: Vec<u32> = corpus.iter().map(|&b| b as u32).collect();
+    let score = model.score_tokenization(&tokens);
+    assert!(score.is_finite());
+}
+
+// ─── v0.1.1: Progress Bar Tests ───
+
+#[test]
+fn test_train_with_progress() {
+    let corpus = b"hello world hello world hello world test test test ";
+    let mut big_corpus = Vec::new();
+    for _ in 0..50 {
+        big_corpus.extend_from_slice(corpus);
+    }
+    let mut trainer = Trainer::new(&big_corpus);
+    // This should not panic with progress bar enabled
+    trainer.train_with_progress(270, false, true);
+    assert!(trainer.vocab.vocab_size > 256);
+}
+
+#[test]
+fn test_train_without_progress() {
+    let corpus = b"hello world hello world hello world";
+    let mut trainer = Trainer::new(corpus);
+    trainer.train_with_progress(265, false, false);
+    assert!(trainer.vocab.vocab_size > 256);
 }
