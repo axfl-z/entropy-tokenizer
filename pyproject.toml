@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "entropy-tokenizer"
-version = "0.1.0"
+version = "0.1.1"
 description = "Entropy-optimal tokenizer — faster and denser than BPE, lossless, GIL-free Rust backend"
 readme = "README.md"
 license = { text = "MIT" }

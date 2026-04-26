@@ -19,12 +19,23 @@ struct BigramEntry {
     log_prob: f64,
 }
 
+/// A special token with a string representation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecialToken {
+    pub name: String,
+    pub id: u32,
+    pub bytes: Vec<u8>,
+}
+
 /// JSON-friendly representation for save/load
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VocabFile {
+    version: String,
     tokens: Vec<Token>,
     bigrams: Vec<BigramEntry>,
     vocab_size: usize,
+    #[serde(default)]
+    special_tokens: Vec<SpecialToken>,
 }
 
 /// The full vocabulary including merge history and token statistics
@@ -33,9 +44,10 @@ pub struct Vocabulary {
     pub tokens: Vec<Token>,
     pub byte_to_id: HashMap<u8, u32>,
     pub bytes_to_id: HashMap<Vec<u8>, u32>,
-    /// Bigram log-probabilities for context-aware encoding: (prev_id, cur_id) -> log_prob
     pub bigram_log_probs: HashMap<(u32, u32), f64>,
     pub vocab_size: usize,
+    pub special_tokens: Vec<SpecialToken>,
+    pub special_name_to_id: HashMap<String, u32>,
 }
 
 impl Vocabulary {
@@ -64,7 +76,151 @@ impl Vocabulary {
             bytes_to_id,
             bigram_log_probs: HashMap::new(),
             vocab_size: 256,
+            special_tokens: Vec::new(),
+            special_name_to_id: HashMap::new(),
         }
+    }
+
+    /// Add a special token (e.g., [PAD], [UNK], [CLS], [SEP]).
+    /// Returns the assigned token ID.
+    pub fn add_special_token(&mut self, name: &str) -> u32 {
+        if let Some(&id) = self.special_name_to_id.get(name) {
+            return id;
+        }
+        let id = self.tokens.len() as u32;
+        let bytes = name.as_bytes().to_vec();
+        self.tokens.push(Token {
+            id,
+            bytes: bytes.clone(),
+            log_prob: 0.0,
+            merge_pair: None,
+        });
+        self.bytes_to_id.insert(bytes.clone(), id);
+        let special = SpecialToken {
+            name: name.to_string(),
+            id,
+            bytes,
+        };
+        self.special_tokens.push(special);
+        self.special_name_to_id.insert(name.to_string(), id);
+        self.vocab_size += 1;
+        id
+    }
+
+    /// Get special token ID by name
+    pub fn get_special_token(&self, name: &str) -> Option<u32> {
+        self.special_name_to_id.get(name).copied()
+    }
+
+    /// Check if a token ID is a special token
+    pub fn is_special(&self, id: u32) -> bool {
+        self.special_tokens.iter().any(|s| s.id == id)
+    }
+
+    /// Prune vocabulary to target size by keeping the most useful tokens.
+    /// Tokens are ranked by frequency (from token_counts). Base byte tokens (0-255)
+    /// and special tokens are always kept.
+    pub fn prune(&mut self, target_size: usize, token_counts: &HashMap<u32, u64>) {
+        if self.vocab_size <= target_size {
+            return;
+        }
+
+        // Collect merge tokens (id >= 256) with their counts, excluding special tokens
+        let special_ids: std::collections::HashSet<u32> = self.special_tokens.iter().map(|s| s.id).collect();
+        let mut merge_tokens: Vec<(u32, u64)> = Vec::new();
+        for token in &self.tokens {
+            if token.id >= 256 && !special_ids.contains(&token.id) {
+                let count = token_counts.get(&token.id).copied().unwrap_or(0);
+                merge_tokens.push((token.id, count));
+            }
+        }
+
+        // Sort by count descending (keep most frequent)
+        merge_tokens.sort_by_key(|t| std::cmp::Reverse(t.1));
+
+        // How many merge tokens can we keep?
+        let special_count = self.special_tokens.len();
+        let keep_merges = target_size.saturating_sub(256 + special_count);
+        let keep_ids: std::collections::HashSet<u32> = merge_tokens.iter()
+            .take(keep_merges)
+            .map(|&(id, _)| id)
+            .collect();
+
+        // Rebuild vocab with only kept tokens, re-assigning IDs
+        let mut new_tokens = Vec::new();
+        let mut id_map: HashMap<u32, u32> = HashMap::new();
+        let mut new_bytes_to_id = HashMap::new();
+        let mut new_byte_to_id = HashMap::new();
+
+        // Keep base byte tokens (0-255)
+        for i in 0u32..256 {
+            let old = &self.tokens[i as usize];
+            let new_id = new_tokens.len() as u32;
+            id_map.insert(i, new_id);
+            new_tokens.push(Token {
+                id: new_id,
+                bytes: old.bytes.clone(),
+                log_prob: old.log_prob,
+                merge_pair: None,
+            });
+            new_byte_to_id.insert(old.bytes[0], new_id);
+            new_bytes_to_id.insert(old.bytes.clone(), new_id);
+        }
+
+        // Keep selected merge tokens
+        for token in &self.tokens {
+            if token.id >= 256 && !special_ids.contains(&token.id) && keep_ids.contains(&token.id) {
+                let new_id = new_tokens.len() as u32;
+                id_map.insert(token.id, new_id);
+                let merge_pair = token.merge_pair.map(|(l, r)| {
+                    (*id_map.get(&l).unwrap_or(&l), *id_map.get(&r).unwrap_or(&r))
+                });
+                new_tokens.push(Token {
+                    id: new_id,
+                    bytes: token.bytes.clone(),
+                    log_prob: token.log_prob,
+                    merge_pair,
+                });
+                new_bytes_to_id.insert(token.bytes.clone(), new_id);
+            }
+        }
+
+        // Re-add special tokens
+        let mut new_specials = Vec::new();
+        let mut new_special_name_to_id = HashMap::new();
+        for special in &self.special_tokens {
+            let new_id = new_tokens.len() as u32;
+            id_map.insert(special.id, new_id);
+            new_tokens.push(Token {
+                id: new_id,
+                bytes: special.bytes.clone(),
+                log_prob: 0.0,
+                merge_pair: None,
+            });
+            new_bytes_to_id.insert(special.bytes.clone(), new_id);
+            new_specials.push(SpecialToken {
+                name: special.name.clone(),
+                id: new_id,
+                bytes: special.bytes.clone(),
+            });
+            new_special_name_to_id.insert(special.name.clone(), new_id);
+        }
+
+        // Rebuild bigram_log_probs with new IDs
+        let mut new_bigrams = HashMap::new();
+        for (&(l, r), &prob) in &self.bigram_log_probs {
+            if let (Some(&nl), Some(&nr)) = (id_map.get(&l), id_map.get(&r)) {
+                new_bigrams.insert((nl, nr), prob);
+            }
+        }
+
+        self.tokens = new_tokens;
+        self.bytes_to_id = new_bytes_to_id;
+        self.byte_to_id = new_byte_to_id;
+        self.bigram_log_probs = new_bigrams;
+        self.vocab_size = self.tokens.len();
+        self.special_tokens = new_specials;
+        self.special_name_to_id = new_special_name_to_id;
     }
 
     /// Add a new token formed by merging left_id and right_id
@@ -147,9 +303,11 @@ impl Vocabulary {
             .collect();
 
         let file = VocabFile {
+            version: "0.1.1".to_string(),
             tokens: self.tokens.clone(),
             bigrams,
             vocab_size: self.vocab_size,
+            special_tokens: self.special_tokens.clone(),
         };
 
         let json = serde_json::to_string_pretty(&file)
@@ -177,12 +335,19 @@ impl Vocabulary {
             bigram_log_probs.insert((entry.left, entry.right), entry.log_prob);
         }
 
+        let mut special_name_to_id = HashMap::new();
+        for st in &file.special_tokens {
+            special_name_to_id.insert(st.name.clone(), st.id);
+        }
+
         Ok(Vocabulary {
             tokens: file.tokens,
             byte_to_id,
             bytes_to_id,
             bigram_log_probs,
             vocab_size: file.vocab_size,
+            special_tokens: file.special_tokens,
+            special_name_to_id,
         })
     }
 }

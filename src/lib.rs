@@ -1,4 +1,6 @@
 pub mod encoder;
+pub mod filters;
+pub mod micromodel;
 pub mod stats;
 pub mod trie;
 pub mod trainer;

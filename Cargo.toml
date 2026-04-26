@@ -1,6 +1,6 @@
 [package]
 name = "entropy-tokenizer"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Entropy-optimal tokenizer that outperforms BPE/Unigram via entropy-guided merge selection and DP-optimal encoding"
 license = "MIT"

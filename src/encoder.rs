@@ -299,6 +299,21 @@ impl Encoder {
     pub fn vocab(&self) -> &Vocabulary {
         &self.vocab
     }
+
+    /// Get mutable vocabulary reference
+    pub fn vocab_mut(&mut self) -> &mut Vocabulary {
+        &mut self.vocab
+    }
+
+    /// Get context weight
+    pub fn context_weight(&self) -> f64 {
+        self.context_weight
+    }
+
+    /// Take ownership of the vocabulary (consumes encoder)
+    pub fn take_vocab(self) -> Vocabulary {
+        self.vocab
+    }
 }
 
 #[cfg(test)]

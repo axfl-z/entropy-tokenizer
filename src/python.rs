@@ -6,6 +6,7 @@ pub mod pymod {
     use pyo3::types::PyBytes;
 
     use crate::encoder::Encoder;
+    use crate::filters::{FilterPipeline, LowercaseAscii, NormalizeWhitespace, StripNonPrintable};
     use crate::trainer::Trainer;
     use crate::vocab::Vocabulary;
 
@@ -14,6 +15,7 @@ pub mod pymod {
     #[pyclass(name = "EOTTokenizer")]
     pub struct PyEOTTokenizer {
         encoder: Encoder,
+        filters: FilterPipeline,
     }
 
     #[pymethods]
@@ -25,13 +27,19 @@ pub mod pymod {
         ///     vocab_size: Target vocabulary size (default 8192).
         ///     context_weight: Weight for bigram context scoring (default 0.3).
         ///     verbose: Print training progress (default False).
+        ///     show_progress: Show progress bar with ETA (default True).
+        ///     special_tokens: List of special token strings (default None).
+        ///     check_quality: Check dataset quality before training (default True).
         #[new]
-        #[pyo3(signature = (corpus, vocab_size=8192, context_weight=0.3, verbose=false))]
+        #[pyo3(signature = (corpus, vocab_size=8192, context_weight=0.3, verbose=false, show_progress=true, special_tokens=None, check_quality=true))]
         fn new(
             corpus: &Bound<'_, PyAny>,
             vocab_size: usize,
             context_weight: f64,
             verbose: bool,
+            show_progress: bool,
+            special_tokens: Option<Vec<String>>,
+            check_quality: bool,
         ) -> PyResult<Self> {
             let bytes: Vec<u8> = if let Ok(s) = corpus.extract::<String>() {
                 s.into_bytes()
@@ -43,23 +51,41 @@ pub mod pymod {
                 ));
             };
 
+            let specials = special_tokens.unwrap_or_default();
+
             let (encoder,) = Python::with_gil(|py| {
                 py.allow_threads(|| {
+                    if check_quality {
+                        let quality = Trainer::check_dataset_quality(&bytes);
+                        if !quality.warnings.is_empty() {
+                            eprintln!("=== Dataset Quality Check ===");
+                            eprintln!("  Score: {:.0}%", quality.quality_score * 100.0);
+                            for w in &quality.warnings {
+                                eprintln!("  WARNING: {}", w);
+                            }
+                            eprintln!("=============================");
+                        }
+                    }
+
                     let mut trainer = Trainer::new(&bytes);
-                    trainer.train(vocab_size, verbose);
-                    let vocab = trainer.into_vocab();
+                    trainer.train_with_progress(vocab_size, verbose, show_progress);
+                    let mut vocab = trainer.into_vocab();
+
+                    for name in &specials {
+                        vocab.add_special_token(name);
+                    }
+
                     (Encoder::new(vocab, context_weight),)
                 })
             });
 
-            Ok(PyEOTTokenizer { encoder })
+            Ok(PyEOTTokenizer {
+                encoder,
+                filters: FilterPipeline::new(),
+            })
         }
 
         /// Load a pre-trained model from a JSON file.
-        ///
-        /// Args:
-        ///     path: Path to the model JSON file.
-        ///     context_weight: Weight for bigram context scoring (default 0.3).
         #[staticmethod]
         #[pyo3(signature = (path, context_weight=0.3))]
         fn from_file(path: &str, context_weight: f64) -> PyResult<Self> {
@@ -68,6 +94,7 @@ pub mod pymod {
             })?;
             Ok(PyEOTTokenizer {
                 encoder: Encoder::new(vocab, context_weight),
+                filters: FilterPipeline::new(),
             })
         }
 
@@ -78,26 +105,116 @@ pub mod pymod {
             })
         }
 
-        /// Encode text into token IDs using DP-optimal segmentation.
-        /// Releases the GIL during encoding for true parallelism.
-        ///
-        /// Args:
-        ///     text: Input text (str or bytes).
-        ///     greedy: Use faster greedy encoding instead of DP-optimal (default False).
-        ///
-        /// Returns:
-        ///     List of token IDs.
-        #[pyo3(signature = (text, greedy=false))]
-        fn encode(&self, text: &Bound<'_, PyAny>, greedy: bool) -> PyResult<Vec<u32>> {
-            let bytes: Vec<u8> = if let Ok(s) = text.extract::<String>() {
+        /// Add a pre-tokenization filter by name.
+        /// Available: "lowercase", "normalize_whitespace", "strip_non_printable"
+        fn add_filter(&mut self, name: &str) -> PyResult<()> {
+            match name {
+                "lowercase" | "lowercase_ascii" => {
+                    self.filters.add(Box::new(LowercaseAscii));
+                }
+                "normalize_whitespace" => {
+                    self.filters.add(Box::new(NormalizeWhitespace));
+                }
+                "strip_non_printable" => {
+                    self.filters.add(Box::new(StripNonPrintable));
+                }
+                _ => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "Unknown filter: '{}'. Available: lowercase, normalize_whitespace, strip_non_printable",
+                        name
+                    )));
+                }
+            }
+            Ok(())
+        }
+
+        /// Get list of active filter names.
+        fn active_filters(&self) -> Vec<String> {
+            self.filters.filter_names().iter().map(|s| s.to_string()).collect()
+        }
+
+        /// Add a special token. Returns its ID.
+        fn add_special_token(&mut self, name: &str) -> u32 {
+            self.encoder.vocab_mut().add_special_token(name)
+        }
+
+        /// Get special token ID by name, or None.
+        fn get_special_token_id(&self, name: &str) -> Option<u32> {
+            self.encoder.vocab().get_special_token(name)
+        }
+
+        /// List all special tokens as list of (name, id) tuples.
+        fn special_tokens(&self) -> Vec<(String, u32)> {
+            self.encoder.vocab().special_tokens.iter()
+                .map(|s| (s.name.clone(), s.id))
+                .collect()
+        }
+
+        /// Prune vocabulary to target size, keeping most frequent tokens.
+        /// Base byte tokens (0-255) and special tokens are always kept.
+        fn prune_vocab(&mut self, target_size: usize, corpus: &Bound<'_, PyAny>) -> PyResult<()> {
+            let bytes: Vec<u8> = if let Ok(s) = corpus.extract::<String>() {
                 s.into_bytes()
-            } else if let Ok(b) = text.extract::<Vec<u8>>() {
+            } else if let Ok(b) = corpus.extract::<Vec<u8>>() {
                 b
             } else {
                 return Err(pyo3::exceptions::PyTypeError::new_err(
-                    "text must be str or bytes",
+                    "corpus must be str or bytes",
                 ));
             };
+
+            let old_size = self.encoder.vocab().vocab_size;
+            let tokens = self.encoder.encode_greedy(&bytes);
+            let mut counts = std::collections::HashMap::new();
+            for &t in &tokens {
+                *counts.entry(t).or_insert(0u64) += 1;
+            }
+
+            self.encoder.vocab_mut().prune(target_size, &counts);
+            let new_size = self.encoder.vocab().vocab_size;
+
+            // Rebuild encoder with pruned vocab
+            let context_weight = self.encoder.context_weight();
+            let vocab = self.encoder.take_vocab();
+            self.encoder = Encoder::new(vocab, context_weight);
+
+            eprintln!("Pruned vocab: {} -> {} tokens", old_size, new_size);
+            Ok(())
+        }
+
+        /// Check dataset quality. Returns dict with score and warnings.
+        #[staticmethod]
+        fn check_quality(corpus: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+            let bytes: Vec<u8> = if let Ok(s) = corpus.extract::<String>() {
+                s.into_bytes()
+            } else if let Ok(b) = corpus.extract::<Vec<u8>>() {
+                b
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "corpus must be str or bytes",
+                ));
+            };
+
+            let quality = Trainer::check_dataset_quality(&bytes);
+
+            Python::with_gil(|py| {
+                let dict = pyo3::types::PyDict::new_bound(py);
+                dict.set_item("quality_score", quality.quality_score)?;
+                dict.set_item("total_bytes", quality.total_bytes)?;
+                dict.set_item("unique_bytes", quality.unique_bytes)?;
+                dict.set_item("byte_entropy", quality.byte_entropy)?;
+                dict.set_item("avg_word_len", quality.avg_word_len)?;
+                dict.set_item("unique_words", quality.unique_words)?;
+                dict.set_item("total_words", quality.total_words)?;
+                dict.set_item("warnings", quality.warnings)?;
+                Ok(dict.into())
+            })
+        }
+
+        /// Encode text into token IDs.
+        #[pyo3(signature = (text, greedy=false))]
+        fn encode(&self, text: &Bound<'_, PyAny>, greedy: bool) -> PyResult<Vec<u32>> {
+            let bytes = self.extract_and_filter(text)?;
 
             let tokens = Python::with_gil(|py| {
                 py.allow_threads(|| {
@@ -113,23 +230,8 @@ pub mod pymod {
         }
 
         /// Encode text using density-optimal DP (minimizes token count).
-        /// Releases the GIL during encoding.
-        ///
-        /// Args:
-        ///     text: Input text (str or bytes).
-        ///
-        /// Returns:
-        ///     List of token IDs (fewest possible tokens).
         fn encode_dense(&self, text: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
-            let bytes: Vec<u8> = if let Ok(s) = text.extract::<String>() {
-                s.into_bytes()
-            } else if let Ok(b) = text.extract::<Vec<u8>>() {
-                b
-            } else {
-                return Err(pyo3::exceptions::PyTypeError::new_err(
-                    "text must be str or bytes",
-                ));
-            };
+            let bytes = self.extract_and_filter(text)?;
 
             let tokens = Python::with_gil(|py| {
                 py.allow_threads(|| self.encoder.encode_dense(&bytes))
@@ -139,29 +241,13 @@ pub mod pymod {
         }
 
         /// Encode text and return token IDs along with byte offsets.
-        /// Releases the GIL during encoding.
-        ///
-        /// Args:
-        ///     text: Input text (str or bytes).
-        ///     greedy: Use greedy encoding (default False).
-        ///
-        /// Returns:
-        ///     Tuple of (token_ids, offsets) where offsets is a list of (start, end) byte positions.
         #[pyo3(signature = (text, greedy=false))]
         fn encode_with_offsets(
             &self,
             text: &Bound<'_, PyAny>,
             greedy: bool,
         ) -> PyResult<(Vec<u32>, Vec<(usize, usize)>)> {
-            let bytes: Vec<u8> = if let Ok(s) = text.extract::<String>() {
-                s.into_bytes()
-            } else if let Ok(b) = text.extract::<Vec<u8>>() {
-                b
-            } else {
-                return Err(pyo3::exceptions::PyTypeError::new_err(
-                    "text must be str or bytes",
-                ));
-            };
+            let bytes = self.extract_and_filter(text)?;
 
             let tokens = Python::with_gil(|py| {
                 py.allow_threads(|| {
@@ -186,13 +272,6 @@ pub mod pymod {
         }
 
         /// Decode token IDs back to bytes.
-        /// Releases the GIL during decoding.
-        ///
-        /// Args:
-        ///     token_ids: List of token IDs.
-        ///
-        /// Returns:
-        ///     Decoded bytes.
         fn decode_bytes<'py>(
             &self,
             py: Python<'py>,
@@ -203,13 +282,6 @@ pub mod pymod {
         }
 
         /// Decode token IDs back to a UTF-8 string.
-        /// Invalid UTF-8 sequences are replaced with the replacement character.
-        ///
-        /// Args:
-        ///     token_ids: List of token IDs.
-        ///
-        /// Returns:
-        ///     Decoded string.
         fn decode(&self, token_ids: Vec<u32>) -> PyResult<String> {
             let bytes = Python::with_gil(|py| {
                 py.allow_threads(|| self.encoder.decode(&token_ids))
@@ -261,13 +333,33 @@ pub mod pymod {
 
         fn __repr__(&self) -> String {
             format!(
-                "EOTTokenizer(vocab_size={}, lossless=True)",
-                self.encoder.vocab().vocab_size
+                "EOTTokenizer(vocab_size={}, lossless=True, filters={})",
+                self.encoder.vocab().vocab_size,
+                if self.filters.is_empty() { "none".to_string() } else { format!("{:?}", self.filters.filter_names()) }
             )
         }
 
         fn __len__(&self) -> usize {
             self.encoder.vocab().vocab_size
+        }
+    }
+
+    impl PyEOTTokenizer {
+        fn extract_and_filter(&self, text: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+            let bytes: Vec<u8> = if let Ok(s) = text.extract::<String>() {
+                s.into_bytes()
+            } else if let Ok(b) = text.extract::<Vec<u8>>() {
+                b
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "text must be str or bytes",
+                ));
+            };
+            if self.filters.is_empty() {
+                Ok(bytes)
+            } else {
+                Ok(self.filters.apply(&bytes))
+            }
         }
     }
 

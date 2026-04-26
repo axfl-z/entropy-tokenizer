@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::io::Write;
+use std::time::Instant;
 
 use crate::stats;
 use crate::vocab::Vocabulary;
@@ -11,13 +13,38 @@ struct Word {
     count: u64,
 }
 
+/// Training progress callback info
+#[derive(Debug, Clone)]
+pub struct TrainProgress {
+    pub step: usize,
+    pub total_steps: usize,
+    pub vocab_size: usize,
+    pub total_tokens: u64,
+    pub entropy: f64,
+    pub elapsed_secs: f64,
+    pub eta_secs: f64,
+    pub phase: u8,
+}
+
+/// Dataset quality report
+#[derive(Debug, Clone)]
+pub struct DatasetQuality {
+    pub total_bytes: usize,
+    pub unique_bytes: usize,
+    pub byte_entropy: f64,
+    pub avg_word_len: f64,
+    pub unique_words: usize,
+    pub total_words: usize,
+    pub warnings: Vec<String>,
+    pub quality_score: f64,
+}
+
 pub struct Trainer {
     pub vocab: Vocabulary,
     words: Vec<Word>,
     pair_counts: HashMap<(u32, u32), i64>,
     token_counts: HashMap<u32, u64>,
     bigram_counts: HashMap<(u32, u32), u64>,
-    /// Current merge phase: 0 = compression-focused, 1 = entropy-guided
     phase: u8,
 }
 
@@ -210,9 +237,111 @@ impl Trainer {
         self.vocab
     }
 
+    /// Check dataset quality before training. Returns warnings if dataset is problematic.
+    pub fn check_dataset_quality(corpus: &[u8]) -> DatasetQuality {
+        let total_bytes = corpus.len();
+        let mut byte_counts = [0u64; 256];
+        for &b in corpus {
+            byte_counts[b as usize] += 1;
+        }
+        let unique_bytes = byte_counts.iter().filter(|&&c| c > 0).count();
+        let byte_entropy = stats::shannon_entropy(&byte_counts);
+
+        let mut word_freq: HashMap<Vec<u8>, u64> = HashMap::new();
+        let mut current_word: Vec<u8> = Vec::new();
+        let mut total_word_len: usize = 0;
+
+        for &b in corpus {
+            if b == b' ' || b == b'\n' || b == b'\t' || b == b'\r' {
+                if !current_word.is_empty() {
+                    total_word_len += current_word.len();
+                    *word_freq.entry(current_word.clone()).or_insert(0) += 1;
+                    current_word.clear();
+                }
+            } else {
+                current_word.push(b);
+            }
+        }
+        if !current_word.is_empty() {
+            total_word_len += current_word.len();
+            *word_freq.entry(current_word).or_insert(0) += 1;
+        }
+
+        let total_words: u64 = word_freq.values().sum();
+        let unique_words = word_freq.len();
+        let avg_word_len = if total_words > 0 {
+            total_word_len as f64 / total_words as f64
+        } else {
+            0.0
+        };
+
+        let mut warnings = Vec::new();
+        let mut quality_score: f64 = 1.0;
+
+        if total_bytes < 100 {
+            warnings.push(format!("Dataset very small ({} bytes). Tokenizer quality will be poor.", total_bytes));
+            quality_score -= 0.4;
+        } else if total_bytes < 1000 {
+            warnings.push(format!("Dataset small ({} bytes). Consider using more data for better results.", total_bytes));
+            quality_score -= 0.2;
+        }
+
+        if byte_entropy < 3.0 {
+            warnings.push(format!("Very low byte entropy ({:.2} bits). Data may be too repetitive or uniform.", byte_entropy));
+            quality_score -= 0.3;
+        } else if byte_entropy < 4.0 {
+            warnings.push(format!("Low byte entropy ({:.2} bits). Data has limited diversity.", byte_entropy));
+            quality_score -= 0.15;
+        }
+
+        if unique_bytes < 20 {
+            warnings.push(format!("Only {} unique byte values. Data uses very limited character set.", unique_bytes));
+            quality_score -= 0.2;
+        }
+
+        if avg_word_len > 50.0 {
+            warnings.push(format!("Average word length {:.1} chars — extremely long. Data may be binary or encoded.", avg_word_len));
+            quality_score -= 0.3;
+        } else if avg_word_len < 1.5 {
+            warnings.push(format!("Average word length {:.1} chars — very short. Data is unusually fragmented.", avg_word_len));
+            quality_score -= 0.15;
+        }
+
+        if total_words > 0 && unique_words as f64 / total_words as f64 > 0.95 {
+            warnings.push("Almost all words are unique. Data may be random/noisy — tokenizer won't learn good merges.".to_string());
+            quality_score -= 0.25;
+        }
+
+        let non_printable: u64 = byte_counts[..32].iter().sum::<u64>() - byte_counts[b'\n' as usize] - byte_counts[b'\t' as usize] - byte_counts[b'\r' as usize];
+        let non_printable_ratio = non_printable as f64 / total_bytes.max(1) as f64;
+        if non_printable_ratio > 0.1 {
+            warnings.push(format!("High non-printable byte ratio ({:.1}%). Data may be binary.", non_printable_ratio * 100.0));
+            quality_score -= 0.2;
+        }
+
+        quality_score = quality_score.clamp(0.0, 1.0);
+
+        DatasetQuality {
+            total_bytes,
+            unique_bytes,
+            byte_entropy,
+            avg_word_len,
+            unique_words,
+            total_words: total_words as usize,
+            warnings,
+            quality_score,
+        }
+    }
+
     pub fn train(&mut self, target_vocab_size: usize, verbose: bool) {
+        self.train_with_progress(target_vocab_size, verbose, true);
+    }
+
+    /// Train with optional progress bar
+    pub fn train_with_progress(&mut self, target_vocab_size: usize, verbose: bool, show_progress: bool) {
         let start_size = self.vocab.vocab_size;
         let num_merges = target_vocab_size.saturating_sub(start_size);
+        let train_start = Instant::now();
 
         if verbose {
             let total_tokens: u64 = self.token_counts.values().sum();
@@ -227,8 +356,9 @@ impl Trainer {
             );
         }
 
+        let progress_interval = if num_merges > 1000 { num_merges / 100 } else if num_merges > 100 { num_merges / 20 } else { 1 };
+
         for step in 0..num_merges {
-            // Phase transition: first 90% compression-focused, last 10% entropy-guided
             let phase_boundary = (num_merges * 9) / 10;
             if step < phase_boundary {
                 self.phase = 0;
@@ -250,6 +380,19 @@ impl Trainer {
             let new_id = self.vocab.add_merge(left_id, right_id);
             self.apply_merge(left_id, right_id, new_id);
 
+            if show_progress && progress_interval > 0 && (step + 1) % progress_interval == 0 {
+                let elapsed = train_start.elapsed().as_secs_f64();
+                let progress = (step + 1) as f64 / num_merges as f64;
+                let eta = if progress > 0.0 { elapsed / progress - elapsed } else { 0.0 };
+                let bar_width = 30;
+                let filled = (progress * bar_width as f64) as usize;
+                let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
+                let phase_str = if self.phase == 0 { "compress" } else { "entropy" };
+                eprint!("\r  [{bar}] {:.0}% | {}/{} merges | {phase_str} | {:.1}s elapsed | ETA {:.1}s  ",
+                    progress * 100.0, step + 1, num_merges, elapsed, eta);
+                let _ = std::io::stderr().flush();
+            }
+
             if verbose && (step + 1) % 100 == 0 {
                 let total_tokens: u64 = self.token_counts.values().sum();
                 let entropy = stats::entropy_from_map(&self.token_counts);
@@ -257,7 +400,7 @@ impl Trainer {
                 let right_bytes = self.vocab.get_bytes(right_id);
                 let merged = self.vocab.get_bytes(new_id);
                 eprintln!(
-                    "Step {}/{}: merged {:?} + {:?} -> {:?} (count={}, score={:.2}, tokens={}, H={:.4})",
+                    "\nStep {}/{}: merged {:?} + {:?} -> {:?} (count={}, score={:.2}, tokens={}, H={:.4})",
                     step + 1,
                     num_merges,
                     String::from_utf8_lossy(left_bytes),
@@ -269,6 +412,13 @@ impl Trainer {
                     entropy,
                 );
             }
+        }
+
+        if show_progress && num_merges > 0 {
+            let elapsed = train_start.elapsed().as_secs_f64();
+            let bar: String = "█".repeat(30);
+            eprint!("\r  [{bar}] 100% | {num_merges}/{num_merges} merges | done | {elapsed:.1}s total          \n");
+            let _ = std::io::stderr().flush();
         }
 
         self.recount_all();
